@@ -1,0 +1,526 @@
+// ============================================================================
+// O Lux Laundry — Prisma Schema
+// ============================================================================
+// Design notes:
+// - `User` is the single auth identity (NextAuth-compatible) for every role.
+// - `Customer` and `DeliveryRider` are 1:1 domain profiles that extend a User
+//   with role-specific data, keeping auth concerns separate from domain data.
+// - `Setting` is a generic key/value table so admins can change business
+//   config (hours, socials, payment keys, etc.) without a code deploy.
+// - `OrderStatusEvent` gives the order-tracking timeline an actual audit
+//   trail instead of just a single mutable `status` column.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------------------------------------------------------
+// Enums
+// ----------------------------------------------------------------------------
+
+enum UserRole {
+  SUPER_ADMIN
+  MANAGER
+  RECEPTIONIST
+  LAUNDRY_STAFF
+  DELIVERY_RIDER
+  CUSTOMER
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  DELETED
+}
+
+enum OrderStatus {
+  PENDING
+  CONFIRMED
+  PICKUP_ASSIGNED
+  PICKED_UP
+  RECEIVED
+  WASHING
+  DRY_CLEANING
+  IRONING
+  PACKAGING
+  QUALITY_CHECK
+  OUT_FOR_DELIVERY
+  DELIVERED
+  CANCELLED
+}
+
+enum PaymentMethod {
+  PAYSTACK
+  CASH
+  BANK_TRANSFER
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCESS
+  FAILED
+  REFUNDED
+}
+
+enum InvoiceStatus {
+  UNPAID
+  PAID
+  PARTIALLY_PAID
+  VOID
+}
+
+enum RefundStatus {
+  PENDING
+  SUCCESS
+  FAILED
+}
+
+enum NotificationType {
+  BOOKING_CREATED
+  PICKUP_CONFIRMED
+  LAUNDRY_RECEIVED
+  LAUNDRY_COMPLETED
+  OUT_FOR_DELIVERY
+  DELIVERED
+  PAYMENT_RECEIVED
+  REFUND_PROCESSED
+  SYSTEM
+}
+
+enum PriceUnit {
+  PER_ITEM
+  PER_KG
+  PER_LOAD
+}
+
+// ----------------------------------------------------------------------------
+// Auth (NextAuth/Auth.js compatible)
+// ----------------------------------------------------------------------------
+
+model User {
+  id              String     @id @default(cuid())
+  name            String
+  email           String     @unique
+  emailVerified   DateTime?
+  passwordHash    String?
+  phone           String?
+  image           String?
+  role            UserRole   @default(CUSTOMER)
+  status          UserStatus @default(ACTIVE)
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  accounts        Account[]
+  sessions        Session[]
+
+  customer        Customer?
+  deliveryRider   DeliveryRider?
+
+  notifications   Notification[]
+  reviewsModerated Review[]       @relation("ReviewModerator")
+  orderStatusEvents OrderStatusEvent[] @relation("StatusChangedBy")
+  auditLogs       AuditLog[]
+  refundsInitiated Refund[]
+
+  passwordResetTokens PasswordResetToken[]
+
+  @@index([role])
+  @@map("users")
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@map("accounts")
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("sessions")
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+  @@map("verification_tokens")
+}
+
+model PasswordResetToken {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("password_reset_tokens")
+}
+
+// ----------------------------------------------------------------------------
+// Customers & Addresses
+// ----------------------------------------------------------------------------
+
+model Customer {
+  id            String   @id @default(cuid())
+  userId        String   @unique
+  loyaltyPoints Int      @default(0)
+  totalOrders   Int      @default(0)
+  totalSpent    Decimal  @default(0) @db.Decimal(12, 2)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  addresses Address[]
+  orders    Order[]
+  payments  Payment[]
+  reviews   Review[]
+  refunds   Refund[]
+
+  @@map("customers")
+}
+
+model Address {
+  id          String   @id @default(cuid())
+  customerId  String
+  label       String? // e.g. "Home", "Office"
+  street      String
+  city        String
+  state       String
+  zoneId      String?
+  isDefault   Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  customer Customer      @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  zone     DeliveryZone? @relation(fields: [zoneId], references: [id])
+  orders   Order[]
+
+  @@index([customerId])
+  @@map("addresses")
+}
+
+// ----------------------------------------------------------------------------
+// Services & Pricing (admin-editable, no code changes required)
+// ----------------------------------------------------------------------------
+
+model Service {
+  id          String   @id @default(cuid())
+  name        String // e.g. "Wash & Fold", "Dry Cleaning", "Ironing"
+  slug        String   @unique
+  description String?
+  icon        String?
+  isActive    Boolean  @default(true)
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  priceItems PriceItem[]
+  orders     Order[]
+
+  @@map("services")
+}
+
+model PriceItem {
+  id        String    @id @default(cuid())
+  serviceId String
+  name      String // e.g. "Shirts", "Native wear", "Suits", "Duvets"
+  unit      PriceUnit @default(PER_ITEM)
+  price     Decimal   @db.Decimal(10, 2)
+  isActive  Boolean   @default(true)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  service    Service     @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  orderItems OrderItem[]
+
+  @@index([serviceId])
+  @@map("price_items")
+}
+
+model DeliveryZone {
+  id            String   @id @default(cuid())
+  name          String
+  deliveryFee   Decimal  @db.Decimal(10, 2)
+  estimatedTime String? // e.g. "Same day", "Next day"
+  isActive      Boolean  @default(true)
+
+  addresses Address[]
+
+  @@map("delivery_zones")
+}
+
+// ----------------------------------------------------------------------------
+// Orders
+// ----------------------------------------------------------------------------
+
+model Order {
+  id                String      @id @default(cuid())
+  orderNumber       String      @unique // e.g. OLX-20260627-A1B2
+  customerId        String
+  addressId         String
+  serviceId         String
+  status            OrderStatus @default(PENDING)
+  pickupDate        DateTime
+  pickupTimeSlot    String // e.g. "10:00 AM - 12:00 PM"
+  deliveryDate      DateTime?
+  specialInstructions String?
+
+  subtotal     Decimal @db.Decimal(12, 2)
+  deliveryFee  Decimal @default(0) @db.Decimal(12, 2)
+  discount     Decimal @default(0) @db.Decimal(12, 2)
+  total        Decimal @db.Decimal(12, 2)
+
+  riderId      String?
+  cancelledReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  customer       Customer           @relation(fields: [customerId], references: [id])
+  address        Address            @relation(fields: [addressId], references: [id])
+  service        Service            @relation(fields: [serviceId], references: [id])
+  rider          DeliveryRider?     @relation(fields: [riderId], references: [id])
+
+  items          OrderItem[]
+  statusEvents   OrderStatusEvent[]
+  payments       Payment[]
+  invoice        Invoice?
+  review         Review?
+  refunds        Refund[]
+
+  @@index([customerId])
+  @@index([status])
+  @@index([riderId])
+  @@map("orders")
+}
+
+model OrderItem {
+  id          String  @id @default(cuid())
+  orderId     String
+  priceItemId String?
+  itemName    String // snapshot, in case PriceItem is later renamed/removed
+  quantity    Int
+  unitPrice   Decimal @db.Decimal(10, 2)
+  lineTotal   Decimal @db.Decimal(12, 2)
+
+  order     Order      @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  priceItem PriceItem? @relation(fields: [priceItemId], references: [id], onDelete: SetNull)
+
+  @@index([orderId])
+  @@map("order_items")
+}
+
+// Append-only audit trail backing the "beautiful progress timeline" UI.
+model OrderStatusEvent {
+  id          String      @id @default(cuid())
+  orderId     String
+  status      OrderStatus
+  note        String?
+  changedById String?
+  createdAt   DateTime    @default(now())
+
+  order     Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  changedBy User? @relation("StatusChangedBy", fields: [changedById], references: [id])
+
+  @@index([orderId])
+  @@map("order_status_events")
+}
+
+// ----------------------------------------------------------------------------
+// Payments & Invoices
+// ----------------------------------------------------------------------------
+
+model Payment {
+  id         String        @id @default(cuid())
+  orderId    String
+  customerId String
+  amount     Decimal       @db.Decimal(12, 2)
+  currency   String        @default("NGN")
+  method     PaymentMethod @default(PAYSTACK)
+  status     PaymentStatus @default(PENDING)
+  reference  String        @unique // Paystack transaction reference
+  paidAt     DateTime?
+  createdAt  DateTime      @default(now())
+  updatedAt  DateTime      @updatedAt
+
+  order    Order    @relation(fields: [orderId], references: [id])
+  customer Customer @relation(fields: [customerId], references: [id])
+  refunds  Refund[]
+
+  @@index([orderId])
+  @@index([customerId])
+  @@map("payments")
+}
+
+model Invoice {
+  id            String        @id @default(cuid())
+  orderId       String        @unique
+  invoiceNumber String        @unique
+  status        InvoiceStatus @default(UNPAID)
+  amountDue     Decimal       @db.Decimal(12, 2)
+  amountPaid    Decimal       @default(0) @db.Decimal(12, 2)
+  pdfUrl        String?
+  issuedAt      DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@map("invoices")
+}
+
+// Mock-Paystack refund record. One payment can have multiple partial refunds,
+// but their amounts can never exceed the original payment amount (enforced
+// in the server action, not the database, since Prisma can't express a
+// cross-row aggregate constraint).
+model Refund {
+  id            String       @id @default(cuid())
+  paymentId     String
+  orderId       String
+  customerId    String
+  amount        Decimal      @db.Decimal(12, 2)
+  reason        String
+  status        RefundStatus @default(PENDING)
+  reference     String       @unique // mock Paystack refund reference
+  initiatedById String? // staff user who triggered the refund
+  processedAt   DateTime?
+  createdAt     DateTime     @default(now())
+
+  payment     Payment  @relation(fields: [paymentId], references: [id])
+  order       Order    @relation(fields: [orderId], references: [id])
+  customer    Customer @relation(fields: [customerId], references: [id])
+  initiatedBy User?    @relation(fields: [initiatedById], references: [id])
+
+  @@index([paymentId])
+  @@index([orderId])
+  @@map("refunds")
+}
+
+// ----------------------------------------------------------------------------
+// Delivery Riders
+// ----------------------------------------------------------------------------
+
+model DeliveryRider {
+  id            String   @id @default(cuid())
+  userId        String   @unique
+  vehicleType   String? // e.g. "Bike", "Van"
+  vehiclePlate  String?
+  isAvailable   Boolean  @default(true)
+  currentZone   String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  orders Order[]
+
+  @@map("delivery_riders")
+}
+
+// ----------------------------------------------------------------------------
+// Reviews
+// ----------------------------------------------------------------------------
+
+model Review {
+  id           String   @id @default(cuid())
+  customerId   String
+  orderId      String   @unique
+  rating       Int // 1-5
+  comment      String?
+  isApproved   Boolean  @default(false)
+  moderatedById String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  customer    Customer @relation(fields: [customerId], references: [id])
+  order       Order    @relation(fields: [orderId], references: [id])
+  moderatedBy User?    @relation("ReviewModerator", fields: [moderatedById], references: [id])
+
+  @@index([customerId])
+  @@map("reviews")
+}
+
+// ----------------------------------------------------------------------------
+// Notifications
+// ----------------------------------------------------------------------------
+
+model Notification {
+  id        String           @id @default(cuid())
+  userId    String
+  type      NotificationType
+  title     String
+  message   String
+  isRead    Boolean          @default(false)
+  metadata  Json?
+  createdAt DateTime         @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, isRead])
+  @@map("notifications")
+}
+
+// ----------------------------------------------------------------------------
+// Settings (generic key/value so admins can change config without a deploy)
+// ----------------------------------------------------------------------------
+
+model Setting {
+  id        String   @id @default(cuid())
+  key       String   @unique // e.g. "business.name", "delivery.defaultFee"
+  value     Json
+  group     String // e.g. "business", "payments", "email", "social"
+  updatedAt DateTime @updatedAt
+
+  @@index([group])
+  @@map("settings")
+}
+
+// ----------------------------------------------------------------------------
+// Audit Logs
+// ----------------------------------------------------------------------------
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  userId     String?
+  action     String // e.g. "ORDER_STATUS_UPDATED", "PRICE_ITEM_DELETED"
+  entityType String // e.g. "Order", "PriceItem"
+  entityId   String?
+  metadata   Json?
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([entityType, entityId])
+  @@map("audit_logs")
+}

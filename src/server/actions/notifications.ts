@@ -170,13 +170,18 @@ export async function saveNotificationPrefsAction(
   try {
     const key = `notifications.prefs.${session.user.id}`;
     const existing = await prisma.setting.findUnique({ where: { key } });
-    const merged = { ...DEFAULT_NOTIFICATION_PREFS, ...(existing?.value ?? {}), ...prefs };
+   const existingPrefs =
+  existing?.value &&
+  typeof existing.value === 'object' &&
+  !Array.isArray(existing.value)
+    ? (existing.value as Record<string, unknown>)
+    : {};
 
-    await prisma.setting.upsert({
-      where: { key },
-      create: { key, value: merged, group: 'notifications' },
-      update: { value: merged },
-    });
+const merged = {
+  ...DEFAULT_NOTIFICATION_PREFS,
+  ...existingPrefs,
+  ...prefs,
+};
 
     return { success: true };
   } catch {

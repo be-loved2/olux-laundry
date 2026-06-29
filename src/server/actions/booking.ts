@@ -172,16 +172,8 @@ export async function createBookingAction(input: BookingInput): Promise<BookingA
       }),
     }).catch((err) => console.error('[booking] Customer email failed:', err));
 
-    // SMS to customer (if phone on file)
-    if (session.user.phone) {
-      const { sendSms } = await import('@/server/services/sms');
-      sendSms({
-        to: session.user.phone.startsWith('+')
-          ? session.user.phone
-          : `+234${session.user.phone.replace(/^0/, '')}`,
-        message: smsTemplates.bookingCreated(orderNumber),
-      }).catch((err) => console.error('[booking] SMS failed:', err));
-    }
+   // SMS temporarily disabled until phone is added to the NextAuth session.
+// TODO: Re-enable after adding `phone` to the session or fetching it from the database.
 
     // Admin notification email — find all SUPER_ADMIN users
     prisma.user
